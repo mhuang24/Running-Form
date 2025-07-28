@@ -19,6 +19,7 @@ frame_counter = 0
 image_width = 540
 image_height = 960
 
+#Use later to help with instantaneous velocity and acceleration calculations later
 right_heel_y=[]
 right_toe_y=[]
 right_heel_acc = []
@@ -31,7 +32,7 @@ MIN_CYCLES = 5
 last_strike = 0
 strike_frames = []
 
-
+#Helper function to calculate the angle between two limbs
 def calculate_angle(a, b, c):
     a = np.array(a) #First landmark
     b = np.array(b)
@@ -54,8 +55,8 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.99) as
         if not paused:
             frame_counter += 1
             ret, frame = cap.read()
-            #frame = cv2.resize(frame, (960, 540))
             frame = cv2.resize(frame, (image_width, image_height))
+
             #Detect stuff and render
             #Recolor image to RGB
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -69,49 +70,12 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.99) as
             #Extract landmarks
             try:
                 landmarks = results.pose_landmarks.landmark
-                """
-                Y_DIFF_THRESH = 0.015  # depends on resolution, tune this
 
-                toe_y = landmarks[32].y
-                heel_y = landmarks[30].y
-                foot_y_diff = abs(toe_y - heel_y)
-
-                # Optional: check foot is also near the ground (e.g., bottom 20% of image)
-                LOW_Y_THRESH = 0.6
-
-                if (foot_y_diff == 0) and (toe_y > LOW_Y_THRESH) and (heel_y > LOW_Y_THRESH):
-                    # Potential foot strike
-                    paused = not paused
-                """
-                """
-                right_toe_vis = landmarks[32].visibility
-                right_heel_vis = landmarks[30].visibility
-                if right_toe_vis < MIN_VISIBILITY or right_heel_vis < MIN_VISIBILITY:
-                    continue
-
-                right_toe_y.append(landmarks[32].y)
-                right_heel_y.append(landmarks[30].y)
-
-                if len(right_heel_y) < 4:
-                    continue
-
-                heel_acc = right_heel_y[-1] - 2 * right_heel_y[-2] + right_heel_y[-3]
-                toe_acc = right_toe_y[-1] - 2 * right_toe_y[-2] + right_toe_y[-3]
-
-                is_low_point = (right_heel_y[-1] > right_heel_y[-2]) and (right_heel_y[-1] > right_heel_y[-3]) and (right_toe_y[-1] > right_toe_y[-2] and right_toe_y[-1] > right_toe_y[-3])
-
-                if (heel_acc > ACC_THRESH and toe_acc > ACC_THRESH) and is_low_point:
-                    paused = not paused
-                    #if not strike_frames or (frame_counter - strike_frames[-1] > MIN_CYCLES):
-                    #    strike_frames.append(frame_counter)
-                    #    paused = not paused
-                """
                 # Update running average of foot to shoulder height
                 # total_height += math.sqrt(abs(landmarks[12].x - landmarks[24].x) ** 2 + abs(landmarks[12].y - landmarks[24].y) ** 2) + math.sqrt(
                 #                           abs(landmarks[24].x - landmarks[26].x) ** 2 + abs(landmarks[24].y - landmarks[26].y) ** 2) + math.sqrt(
                 #                           abs(landmarks[28].x - landmarks[26].x) ** 2 + abs(landmarks[28].y - landmarks[26].y) ** 2)
                 # avg_height = total_height / frame_counter
-
 
                 #Right knee angle
                 right_hip = (landmarks[24].x, landmarks[24].y)
@@ -157,6 +121,8 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.99) as
                             (right_ankle_coords[0] + 10, right_ankle_coords[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
 
+                #Currently working on detecting foot-ground contact here
+                #WORK IN PROGRESS
                 right_toe_vis = landmarks[32].visibility
                 right_heel_vis = landmarks[30].visibility
                 if right_toe_vis < MIN_VISIBILITY or right_heel_vis < MIN_VISIBILITY:
@@ -209,9 +175,6 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.99) as
                         #    strike_frames.append(frame_counter)
                         #    paused = not paused
 
-
-
-
             except:
                 pass
 
@@ -222,10 +185,8 @@ with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.99) as
 
             cv2.imshow("Frame", image)
 
-            #print(results)
 
-            #cv2.imshow('MediaPipe Feed', frame)
-        key = cv2.waitKey(1) & 0xFF  # 30ms delay between frames
+        key = cv2.waitKey(1) & 0xFF
 
         if key == ord('p'):
             paused = not paused  # Toggle pause
