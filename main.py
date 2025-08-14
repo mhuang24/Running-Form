@@ -1,199 +1,200 @@
-from os import supports_dir_fd
-
 import cv2
 import mediapipe as mp
 import numpy as np
-import math
-
-from mediapipe.python.solutions.drawing_utils import RED_COLOR
+from collections import deque
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
-mp_holistic = mp.solutions.holistic
 
-#VIDEO FEED
-cap = cv2.VideoCapture("IMG_5396.mp4")
-paused = False
-total_height = 0
-frame_counter = 0
-image_width = 540
-image_height = 960
-
-#Use later to help with instantaneous velocity and acceleration calculations later
-right_heel_y=[]
-right_toe_y=[]
-right_heel_acc = []
-right_toe_acc = []
-
+# --- Config ---
+WORK_W, WORK_H = 540, 960
 MIN_VISIBILITY = 0.7
-ACC_THRESH = -0.003
-MIN_CYCLES = 5
+Y_DIFF_FLAT_THRESH = 0.015  # toe vs heel y should be close (normalized)
+DEBOUNCE_SEC = 0.25  # minimum time between strikes
+PAST_WINDOW_FRAMES = 30  # choose best frame from recent window
 
-last_strike = 0
-strike_frames = []
 
-#Helper function to calculate the angle between two limbs
-def calculate_angle(a, b, c):
-    a = np.array(a) #First landmark
-    b = np.array(b)
-    c = np.array(c)
+# --- Helpers ---
+def calc_angle(a, b, c):
+    a = np.array(a, float);
+    b = np.array(b, float);
+    c = np.array(c, float)
+    ab = a - b;
+    cb = c - b
+    cosang = np.dot(ab, cb) / (np.linalg.norm(ab) * np.linalg.norm(cb) + 1e-9)
+    return np.degrees(np.arccos(np.clip(cosang, -1, 1)))
 
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0],) - np.arctan2(a[1]-b[1], a[0]-b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    return angle %360
 
-def angle_between_vectors(v1, v2):
-    unit_v1 = v1 / np.linalg.norm(v1)
-    unit_v2 = v2 / np.linalg.norm(v2)
-    dot_product = np.dot(unit_v1, unit_v2)
-    angle_rad = np.arccos(np.clip(dot_product, -1.0, 1.0))
-    return np.degrees(angle_rad)
+def angle_between(v1, v2):
+    v1 = np.array(v1, float);
+    v2 = np.array(v2, float)
+    v1 /= (np.linalg.norm(v1) + 1e-9);
+    v2 /= (np.linalg.norm(v2) + 1e-9)
+    return np.degrees(np.arccos(np.clip(np.dot(v1, v2), -1, 1)))
 
+
+def to_px(pt, W, H): return (int(pt[0] * W), int(pt[1] * H))
+
+
+# Finite differences
+def first_diff(series):
+    if len(series) < 2: return None
+    return series[-1] - series[-2]
+
+
+def velocity_zero_crossing(v_series):
+    # detect last crossing from negative -> non-negative
+    if len(v_series) < 2: return False
+    return (v_series[-2] > 0) and (v_series[-1] <= 0)
+
+
+# --- Init ---
+cap = cv2.VideoCapture("IMG_5396.mp4")
+if not cap.isOpened():
+    raise RuntimeError("Could not open video")
+
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+debounce_frames = int(DEBOUNCE_SEC * fps)
+
+paused = False
+frame_idx = -1
+last_strike_frame = -10 ** 9
+next_strike_frame = None
+skip_display_this_iteration = False
+pause_after_next_frame = False
+
+# Rolling series for y and vy
+toe_y = deque(maxlen=256)
+heel_y = deque(maxlen=256)
+toe_v = deque(maxlen=256)
+heel_v = deque(maxlen=256)
+
+# Rolling recent frame buffer: store (frame_index, toe_x)
+recent_frames = deque(maxlen=90)
 
 with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.99) as pose:
-    while cap.isOpened():
-        if not paused:
-            frame_counter += 1
-            ret, frame = cap.read()
-            frame = cv2.resize(frame, (image_width, image_height))
+    while True:
+        skip_display_this_iteration = False
 
-            #Detect stuff and render
-            #Recolor image to RGB
+        if not paused:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
+
+            # Resize to your working resolution
+            frame = cv2.resize(frame, (WORK_W, WORK_H))
+            H, W = frame.shape[:2]
+
+            # Mediapipe
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image.flags.writeable = False
-            #Make detection
             results = pose.process(image)
-            #Recolor back to BGR
             image.flags.writeable = True
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-            #Extract landmarks
-            try:
-                landmarks = results.pose_landmarks.landmark
+            if results.pose_landmarks:
+                lm = results.pose_landmarks.landmark
+                R_SH = mp_pose.PoseLandmark.RIGHT_SHOULDER.value
+                R_HI = mp_pose.PoseLandmark.RIGHT_HIP.value
+                R_KN = mp_pose.PoseLandmark.RIGHT_KNEE.value
+                R_AN = mp_pose.PoseLandmark.RIGHT_ANKLE.value
+                R_HE = mp_pose.PoseLandmark.RIGHT_HEEL.value
+                R_TO = mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value
 
-                # Update running average of foot to shoulder height
-                # total_height += math.sqrt(abs(landmarks[12].x - landmarks[24].x) ** 2 + abs(landmarks[12].y - landmarks[24].y) ** 2) + math.sqrt(
-                #                           abs(landmarks[24].x - landmarks[26].x) ** 2 + abs(landmarks[24].y - landmarks[26].y) ** 2) + math.sqrt(
-                #                           abs(landmarks[28].x - landmarks[26].x) ** 2 + abs(landmarks[28].y - landmarks[26].y) ** 2)
-                # avg_height = total_height / frame_counter
+                if lm[R_TO].visibility >= MIN_VISIBILITY and lm[R_HE].visibility >= MIN_VISIBILITY:
+                    r_sh = (lm[R_SH].x, lm[R_SH].y)
+                    r_hip = (lm[R_HI].x, lm[R_HI].y)
+                    r_knee = (lm[R_KN].x, lm[R_KN].y)
+                    r_ank = (lm[R_AN].x, lm[R_AN].y)
+                    r_toe = (lm[R_TO].x, lm[R_TO].y)
+                    r_heel = (lm[R_HE].x, lm[R_HE].y)
 
-                #Right knee angle
-                right_hip = (landmarks[24].x, landmarks[24].y)
-                right_knee = (landmarks[26].x, landmarks[26].y)
-                right_ankle = (landmarks[28].x, landmarks[28].y)
-                knee_angle = calculate_angle(right_hip, right_knee, right_ankle)
-                right_knee_coords = tuple(np.multiply(
-                    [right_knee[0], right_knee[1]],
-                    [image_width, image_height]
-                ).astype(int))
-                cv2.putText(image, str(math.trunc(knee_angle)),
-                            (right_knee_coords[0] + 10, right_knee_coords[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA
-                            )
+                    # angles (optional HUD)
+                    knee_ang = calc_angle(r_hip, r_knee, r_ank)
+                    hip_ang = calc_angle(r_sh, r_hip, r_knee)
+                    shin_vec = (lm[R_AN].x - lm[R_KN].x, lm[R_AN].y - lm[R_KN].y)
+                    foot_vec = (lm[R_TO].x - lm[R_HE].x, lm[R_TO].y - lm[R_HE].y)
+                    ankle_ang = angle_between(shin_vec, foot_vec)
+                    cv2.putText(image, f"{int(round(knee_ang))}",
+                                (to_px(r_knee, W, H)[0] + 10, to_px(r_knee, W, H)[1] - 10), 0, 0.5, (255, 255, 255), 2)
+                    cv2.putText(image, f"{int(round(hip_ang))}",
+                                (to_px(r_hip, W, H)[0] + 10, to_px(r_hip, W, H)[1] - 10), 0, 0.5, (255, 255, 255), 2)
+                    cv2.putText(image, f"{int(round(ankle_ang))}",
+                                (to_px(r_ank, W, H)[0] + 10, to_px(r_ank, W, H)[1] - 10), 0, 0.5, (255, 255, 255), 2)
 
-                #Right hip angle
-                right_shoulder = (landmarks[12].x, landmarks[12].y)
-                right_hip_angle = calculate_angle(right_shoulder, right_hip, right_knee)
-                right_hip_coords = tuple(np.multiply(
-                    [right_hip[0], right_hip[1]],
-                    [image_width, image_height]
-                ).astype(int))
-                cv2.putText(image, str(math.trunc(right_hip_angle)),
-                            (right_hip_coords[0] + 10, right_hip_coords[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                    # update series & velocities (normalized coords)
+                    toe_y.append(r_toe[1]);
+                    heel_y.append(r_heel[1])
+                    toe_v.append(first_diff(toe_y) or 0.0)
+                    heel_v.append(first_diff(heel_y) or 0.0)
 
-                #Right ankle angle
-                right_knee = landmarks[26]
-                right_ankle = landmarks[28]
-                right_toe = landmarks[32]
-                right_heel = landmarks[30]
+                    # keep recent frames buffer
+                    recent_frames.append((frame_idx, r_toe[0]))
 
-                shin_vec = np.array([right_ankle.x - right_knee.x, right_ankle.y - right_knee.y])
-                foot_vec = np.array([right_toe.x - right_heel.x, right_toe.y - right_heel.y])
+                    # Heuristic: velocity zero crossing (down -> up) + flat foot + debounce
+                    strike = (
+                            velocity_zero_crossing(toe_v) and
+                            velocity_zero_crossing(heel_v) and
+                            abs(r_toe[1] - r_heel[1]) < Y_DIFF_FLAT_THRESH and
+                            (frame_idx - last_strike_frame) > debounce_frames
+                    )
 
-                right_ankle_angle = angle_between_vectors(shin_vec, foot_vec)
-                right_ankle_coords = tuple(np.multiply(
-                    [right_ankle.x, right_ankle.y],
-                    [image_width, image_height]
-                ).astype(int))
+                    if strike:
+                        last_strike_frame = frame_idx
 
-                cv2.putText(image, str(math.trunc(right_ankle_angle)),
-                            (right_ankle_coords[0] + 10, right_ankle_coords[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                        # choose best frame from recent window (max toe x)
+                        window = [t for t in recent_frames if frame_idx - t[0] <= PAST_WINDOW_FRAMES]
+                        if window:
+                            best_frame, _ = max(window, key=lambda t: t[1])
+                        else:
+                            best_frame = frame_idx
 
-                #Currently working on detecting foot-ground contact here
-                #WORK IN PROGRESS
-                right_toe_vis = landmarks[32].visibility
-                right_heel_vis = landmarks[30].visibility
-                if right_toe_vis < MIN_VISIBILITY or right_heel_vis < MIN_VISIBILITY:
-                    continue
+                        # seek & pause immediately
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, max(best_frame, 0))
+                        frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1  # next loop increments to exact frame
+                        next_strike_frame = best_frame
+                        pause_after_next_frame = True
+                        skip_display_this_iteration = True
 
-                right_toe_y.append(landmarks[32].y)
-                right_heel_y.append(landmarks[30].y)
+                # draw skeleton
+                mp_drawing.draw_landmarks(
+                    image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2),
+                    mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=2),
+                )
 
-                if len(right_heel_y) < 4:
-                    continue
+            # Draw strike indicator if this is the strike frame
+            if frame_idx == next_strike_frame:
+                if results.pose_landmarks:
+                    lm = results.pose_landmarks.landmark
+                    R_TO = mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value
+                    r_toe = (lm[R_TO].x, lm[R_TO].y)
+                    cv2.circle(image, to_px(r_toe, W, H), 8, (0, 255, 0), -1)
+                    cv2.putText(image, "STRIKE", (20, 140), 0, 0.8, (0, 255, 0), 2)
+                    next_strike_frame = None
 
-                heel_acc = right_heel_y[-1] - 2 * right_heel_y[-2] + right_heel_y[-3]
-                toe_acc = right_toe_y[-1] - 2 * right_toe_y[-2] + right_toe_y[-3]
-                cv2.putText(image, "toe y: "+str(round(landmarks[32].y, 4)), (10,50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(image, "heel y: "+str(round(landmarks[30].y, 4)), (10,70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(image, "toe_acc: "+str(round(toe_acc, 4)), (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(image, "heel_acc: "+str(round(heel_acc, 4)), (10,110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+            # HUD
+            cv2.putText(image, f"frame: {frame_idx}", (20, 30), 0, 0.6, (255, 255, 255), 2)
 
-
-                is_low_point = (right_heel_y[-2] < right_heel_y[-1]) and (right_heel_y[-2] < right_heel_y[-3]) and (
-                        right_toe_y[-2] < right_toe_y[-1] and right_toe_y[-2] < right_toe_y[-3])
-
-                #Check for local maximum in y(lowest point) and near-zero vertical velocity
-                #if abs(right_ankle.x - right_knee.x) < .01:
-                if (toe_acc < 0 and heel_acc < 0 and abs(landmarks[32].y - landmarks[30].y) < .01):
-                    #Set timer for cycles
-                    temp = frame_counter - last_strike
-                    if temp > 30:
-                        paused = not paused
-                        last_strike = frame_counter
-                        strike_frames = []
-                    else:
-                        strike_frames.append(frame_counter)
-
-                if frame_counter - last_strike > 30:
-                    paused = not paused
-                    max_x = 0
-                    for i in strike_frames:
-                        max_x = max(max_x, i.x)
-                        print(max_x)
-                    #go to frame with max x
-
-
-                    # if (heel_acc > ACC_THRESH and toe_acc > ACC_THRESH) and is_low_point:
-                    #     temp = frame_counter - last_strike
-                    # if temp > 20:
-                    #     last_strike = frame_counter
-                    #paused = not paused
-                        # if not strike_frames or (frame_counter - strike_frames[-1] > MIN_CYCLES):
-                        #    strike_frames.append(frame_counter)
-                        #    paused = not paused
-
-            except:
-                pass
-
-            #Render detections
-            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                      mp_drawing.DrawingSpec(color=(255,0,0),thickness=2, circle_radius=2),
-                                      mp_drawing.DrawingSpec(color=(0,0,255),thickness=2, circle_radius=2),)
-
+        # Display if not skipped
+        if not paused and not skip_display_this_iteration:
             cv2.imshow("Frame", image)
 
-
+        # Key handling
         key = cv2.waitKey(1) & 0xFF
-
         if key == ord('p'):
-            paused = not paused  # Toggle pause
-
+            paused = not paused
         elif key == ord('q') or key == 27:
-            break  # Quit on 'q' or ESC
+            break
+        elif paused and key == ord('n'):
+            # single-step one frame when paused
+            paused = False
 
-    cap.release()
-    cv2.destroyAllWindows()
+        # Pause after next frame if requested
+        if pause_after_next_frame:
+            paused = True
+            pause_after_next_frame = False
 
+cap.release()
+cv2.destroyAllWindows()
